@@ -460,6 +460,107 @@ export function convertToolChoiceToAnthropic(
 }
 
 // ----------------------------------------------------------------------
+// Anthropic prompt-caching auto-injection
+// ----------------------------------------------------------------------
+
+/**
+ * Auto-inject Anthropic prompt-caching breakpoints into a Claude request.
+ *
+ * Strategy (Anthropic docs):
+ *   1. System prompt  → last TextBlock gets cache_control
+ *   2. Stable history → last content block of the penultimate message gets
+ *      cache_control (the final message is the new query — skip it)
+ *   3. Tool definitions → last tool gets cache_control
+ *
+ * No-op when:
+ *   - The caller already placed any cache_control on a block (manual wins)
+ *   - Nothing worth caching (no system, single-turn, no tools)
+ *
+ * Returns new objects; inputs are never mutated.
+ */
+export function autoInjectPromptCaching(opts: {
+  system: string | Anthropic.TextBlockParam[] | undefined;
+  messages: Anthropic.MessageParam[];
+  tools: Anthropic.Tool[] | undefined;
+}): {
+  system: string | Anthropic.TextBlockParam[] | undefined;
+  messages: Anthropic.MessageParam[];
+  tools: Anthropic.Tool[] | undefined;
+} {
+  const cc = { type: "ephemeral" as const };
+
+  // Bail out if caller already set cache_control anywhere — respect manual control.
+  const hasCC = (x: unknown): boolean =>
+    !!(x !== null && typeof x === "object" && "cache_control" in (x as object) &&
+      (x as Record<string, unknown>)["cache_control"]);
+  const alreadyCached =
+    (Array.isArray(opts.system) && opts.system.some(hasCC)) ||
+    opts.messages.some(
+      (m) => Array.isArray(m.content) && (m.content as unknown[]).some(hasCC),
+    ) ||
+    (opts.tools ?? []).some(hasCC);
+
+  if (alreadyCached) return opts;
+
+  let { system, messages, tools } = opts;
+
+  // 1. System prompt caching
+  //    string → convert to TextBlockParam[] so we can attach cache_control
+  //    TextBlockParam[] → add cache_control to the last block
+  if (typeof system === "string" && system.length > 0) {
+    system = [{ type: "text", text: system, cache_control: cc }];
+  } else if (Array.isArray(system) && system.length > 0) {
+    const last = system[system.length - 1];
+    system = [...system.slice(0, -1), { ...last, cache_control: cc }];
+  }
+
+  // 2. Stable conversation history: last *cacheable* content block of the penultimate message.
+  //    Only text / image / tool_result blocks support cache_control.
+  //    tool_use and thinking blocks do NOT — Anthropic returns 400 if you try.
+  //    The very last message is the current user query — skip it.
+  if (messages.length >= 2) {
+    const CACHEABLE_BLOCK_TYPES = new Set(["text", "image", "tool_result"]);
+    const ti = messages.length - 2;
+    const target = messages[ti];
+    if (Array.isArray(target.content)) {
+      const blocks = target.content as Anthropic.ContentBlockParam[];
+      // Find the last block whose type supports cache_control (walk backwards)
+      let insertAt = -1;
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const bt = (blocks[i] as unknown as Record<string, unknown>)["type"];
+        if (typeof bt === "string" && CACHEABLE_BLOCK_TYPES.has(bt)) {
+          insertAt = i;
+          break;
+        }
+      }
+      if (insertAt >= 0) {
+        const updated = blocks.map((b, i) =>
+          i === insertAt
+            ? ({ ...(b as unknown as Record<string, unknown>), cache_control: cc } as Anthropic.ContentBlockParam)
+            : b,
+        );
+        messages = [
+          ...messages.slice(0, ti),
+          { ...target, content: updated },
+          ...messages.slice(ti + 1),
+        ];
+      }
+    }
+  }
+
+  // 3. Tool definitions: last tool gets cache_control
+  if (tools && tools.length > 0) {
+    const lastTool = tools[tools.length - 1];
+    tools = [
+      ...tools.slice(0, -1),
+      { ...(lastTool as unknown as Record<string, unknown>), cache_control: cc } as Anthropic.Tool,
+    ];
+  }
+
+  return { system, messages, tools };
+}
+
+// ----------------------------------------------------------------------
 // Gemini model config helpers
 // ----------------------------------------------------------------------
 
@@ -689,14 +790,28 @@ async function handleClaudeStream(
   const rawMaxTokens = body.max_tokens && body.max_tokens > 0 ? body.max_tokens : modelMax;
   const maxTokens = Math.min(rawMaxTokens, modelMax);
 
-  const { system, messages: anthropicMessages } = convertMessagesToAnthropic(messages);
+  const { system: rawSystem, messages: rawAnthropicMessages } = convertMessagesToAnthropic(messages);
 
-  const anthropicTools = (tools && tools.length > 0 && tool_choice !== "none")
+  const rawAnthropicTools = (tools && tools.length > 0 && tool_choice !== "none")
     ? convertToolsToAnthropic(tools)
     : undefined;
   const anthropicToolChoice = (tool_choice && tool_choice !== "none")
     ? convertToolChoiceToAnthropic(tool_choice)
     : undefined;
+
+  // Auto-inject prompt-caching breakpoints (no-op if caller already set cache_control).
+  // Wrapped in try-catch: any injection error falls back to original params so the
+  // request always proceeds normally.
+  let system = rawSystem;
+  let anthropicMessages = rawAnthropicMessages;
+  let anthropicTools = rawAnthropicTools;
+  try {
+    ({ system, messages: anthropicMessages, tools: anthropicTools } = autoInjectPromptCaching({
+      system: rawSystem,
+      messages: rawAnthropicMessages,
+      tools: rawAnthropicTools,
+    }));
+  } catch { /* ignore — proceed without caching */ }
 
   const params: Record<string, unknown> = {
     model: baseModel,
@@ -861,15 +976,29 @@ async function handleClaudeNonStream(
   const rawMaxTokens = body.max_tokens && body.max_tokens > 0 ? body.max_tokens : modelMax;
   const maxTokens = Math.min(rawMaxTokens, modelMax);
 
-  const { system, messages: anthropicMessages } = convertMessagesToAnthropic(messages);
+  const { system: rawSystem, messages: rawAnthropicMessages } = convertMessagesToAnthropic(messages);
 
   // When tool_choice is "none", suppress tools entirely (Anthropic has no "none" option)
-  const anthropicTools = (tools && tools.length > 0 && tool_choice !== "none")
+  const rawAnthropicTools = (tools && tools.length > 0 && tool_choice !== "none")
     ? convertToolsToAnthropic(tools)
     : undefined;
   const anthropicToolChoice = (tool_choice && tool_choice !== "none")
     ? convertToolChoiceToAnthropic(tool_choice)
     : undefined;
+
+  // Auto-inject prompt-caching breakpoints (no-op if caller already set cache_control).
+  // Wrapped in try-catch: any injection error falls back to original params so the
+  // request always proceeds normally.
+  let system = rawSystem;
+  let anthropicMessages = rawAnthropicMessages;
+  let anthropicTools = rawAnthropicTools;
+  try {
+    ({ system, messages: anthropicMessages, tools: anthropicTools } = autoInjectPromptCaching({
+      system: rawSystem,
+      messages: rawAnthropicMessages,
+      tools: rawAnthropicTools,
+    }));
+  } catch { /* ignore — proceed without caching */ }
 
   const params: Record<string, unknown> = {
     model: baseModel,

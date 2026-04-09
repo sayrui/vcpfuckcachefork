@@ -69,6 +69,7 @@ import {
   convertMessagesToGemini,
   convertToolsToAnthropic,
   convertToolChoiceToAnthropic,
+  autoInjectPromptCaching,
   resolveImageUrls,
   stripGeminiSuffix,
   type ChatBody,
@@ -110,13 +111,26 @@ async function runJobBackground(body: ChatBody, job: Job): Promise<void> {
       const modelMax = getClaudeMaxTokens(baseModel);
       const rawMaxTokens = body.max_tokens && body.max_tokens > 0 ? body.max_tokens : modelMax;
       const maxTokens = Math.min(rawMaxTokens, modelMax);
-      const { system, messages: anthropicMessages } = convertMessagesToAnthropic(messages);
-      const anthropicTools = (body.tools?.length && body.tool_choice !== "none")
+      const { system: rawSystem, messages: rawAnthropicMessages } = convertMessagesToAnthropic(messages);
+      const rawAnthropicTools = (body.tools?.length && body.tool_choice !== "none")
         ? convertToolsToAnthropic(body.tools)
         : undefined;
       const anthropicToolChoice = (body.tool_choice && body.tool_choice !== "none")
         ? convertToolChoiceToAnthropic(body.tool_choice)
         : undefined;
+
+      // Auto-inject prompt-caching breakpoints (no-op if caller already set cache_control).
+      // Wrapped in try-catch: any injection error falls back to original params.
+      let system = rawSystem;
+      let anthropicMessages = rawAnthropicMessages;
+      let anthropicTools = rawAnthropicTools;
+      try {
+        ({ system, messages: anthropicMessages, tools: anthropicTools } = autoInjectPromptCaching({
+          system: rawSystem,
+          messages: rawAnthropicMessages,
+          tools: rawAnthropicTools,
+        }));
+      } catch { /* ignore — proceed without caching */ }
 
       const params: Record<string, unknown> = {
         model: baseModel, max_tokens: maxTokens, messages: anthropicMessages, stream: true,

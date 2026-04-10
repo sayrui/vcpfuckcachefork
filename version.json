@@ -1,0 +1,107 @@
+{
+  "version": "1.2.0",
+  "releaseDate": "2026-04-09",
+  "changelog": [
+    "Perf / 性能: modelGroups 读取改为进程内缓存 -- readGroups() now uses in-process cache; disk read occurs only once per write cycle instead of on every request",
+    "Refactor / 重构: versionUtils 提取为共享模块，消除跨文件重复 -- findProjectRoot / resolveVersionUrl / compareVersions extracted to shared versionUtils.ts",
+    "Refactor / 重构: extractUpstreamError 辅助函数统一四处错误提取逻辑 -- Shared extractUpstreamError() helper replaces four identical catch blocks; upstream 3xx now normalised to 4xx",
+    "Clean / 清理: models.ts 内联 makeModel，health.ts 移除无用 Zod 校验 -- makeModel inlined; health route no longer runs Zod parse on a hardcoded constant",
+    "Fix / 修复: 更新提示词中的 git fetch URL 改用常量而非重复硬编码 -- Update Agent prompt: git fetch URL now uses the GITHUB_URL constant instead of a second hardcoded string",
+    "Config / 配置: 仓库地址更新为 github.com/ygffgiwkfgywgef8-ai/vcrep（已公开）-- Repo URL updated to ygffgiwkfgywgef8-ai/vcrep (now public)"
+  ],
+  "history": [
+    {
+      "version": "1.1.7",
+      "releaseDate": "2026-04-07",
+      "changelog": [
+        "New / 新增: 配置向导新增 PROXY_API_KEY 输入框，由用户直接填写密钥值 -- Setup wizard now has a PROXY_API_KEY input field",
+        "New / 新增: 统一一键提示词 -- 根据缺失项自动生成包含密钥设置 + Integration 配置 + 重启的完整 Agent 提示词，复制后发给 Assistant 即可完成全部配置 -- Unified one-click Agent prompt covering key setup, integrations, and server restart",
+        "Fix / 修复: 向导跳过（稍后配置）状态现持久化至 localStorage，刷新页面后不再重新弹出配置向导 -- Wizard dismissal now persisted in localStorage; no more wizard re-appear on page reload",
+        "Fix / 修复: 全部配置就绪时自动清除 localStorage 标记，确保配置完成后从不再显示向导 -- localStorage flag cleared automatically when all config is ready"
+      ]
+    },
+    {
+      "version": "1.1.6",
+      "releaseDate": "2026-04-07",
+      "changelog": [
+        "New / 新增: Gemini 路由 -- model 名以 gemini- 开头时自动路由至 Google Gemini（Replit 内置集成，无需自备密钥）-- Gemini routing: gemini-* models route to Google Gemini via Replit AI Integration",
+        "New / 新增: OpenRouter 路由 -- model 名含 / 时（如 meta-llama/llama-4-maverick）自动路由至 OpenRouter（Replit 内置集成）-- OpenRouter routing: models with / in name (e.g. meta-llama/llama-4-maverick) route to OpenRouter",
+        "New / 新增: Gemini Thinking 模式 -- gemini-*-thinking / gemini-*-thinking-visible 后缀启用 thinkingConfig -- Gemini thinking mode via -thinking / -thinking-visible model suffixes",
+        "New / 新增: OpenRouter 模型默认组（xAI Grok / Llama / DeepSeek / Mistral / Qwen 等）已内置在模型组管理中 -- OpenRouter model group pre-configured with popular models"
+      ]
+    },
+    {
+      "version": "1.1.5",
+      "releaseDate": "2026-04-07",
+      "changelog": [
+        "Fix / 修复: Claude Thinking 模式 budget_tokens 改为动态计算 min(10000, maxTokens×60%)，避免 thinking 耗尽全部 token -- Claude thinking budget_tokens now dynamic: min(10000, maxTokens×60%), prevents thinking from consuming all available tokens",
+        "Fix / 修复: 禁用全部 HTTP server 层超时（headersTimeout / requestTimeout / socket timeout），长时间生成不再被服务器侧截断 -- All HTTP server timeouts disabled; long generations (10k+ tokens) are never cut short server-side",
+        "Fix / 修复: OpenAI 流式补充每 5 秒 keepalive 心跳，与 Claude 流式行为对齐，防止代理层 60 s 空闲超时 -- OpenAI stream handler now sends keepalive every 5 s, matching Claude stream behavior"
+      ]
+    },
+    {
+      "version": "1.1.4",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "New / 新增: 更新方式改为 Agent 提示词一键复制 -- Update flow is now Agent-prompt based: click copy, paste to Replit Agent, done",
+        "Remove / 移除: 删除 POST /api/admin/rebuild 接口（跨部署模式不稳定）-- Removed POST /api/admin/rebuild (unreliable across deployment modes)",
+        "Clean / 清理: Agent 提示词不再提及已移除的 rebuild 接口 -- Agent prompt no longer references the removed rebuild API"
+      ]
+    },
+    {
+      "version": "1.1.3",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "New / 新增: 模型组管理面板，支持分组和单个模型的启用/停用 -- Model Groups panel with per-group and per-model enable/disable toggles",
+        "New / 新增: 停用的模型返回 HTTP 403 而非转发给上游 -- Disabled models return HTTP 403 instead of forwarding to upstream",
+        "New / 新增: GET /v1/models 只返回已启用的模型 -- GET /v1/models only returns enabled models",
+        "New / 新增: model-groups.json 持久化，新模型自动合并 -- model-groups.json persisted to disk with automatic merge for new models"
+      ]
+    },
+    {
+      "version": "1.1.2.2",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "New / 新增: POST /api/admin/rebuild 编译完成后通过 process.exit(0) 自动重启 -- POST /api/admin/rebuild auto-restarts server via process.exit(0)",
+        "Fix / 修复: 退出前延迟 1 秒确保 HTTP 响应已发送 -- 1 s delay before exit ensures HTTP response is flushed"
+      ]
+    },
+    {
+      "version": "1.1.2.1",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "Fix / 修复: compareVersions 使用 parseInt，相同版本段正确返回 0 -- compareVersions uses parseInt; equal segments return 0",
+        "New / 新增: 版本号格式 MAJOR.MINOR.PATCH[.BUILD]，全部为纯整数 -- Versioning scheme MAJOR.MINOR.PATCH[.BUILD], all plain integers"
+      ]
+    },
+    {
+      "version": "1.1.2",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "Fix / 修复: 安装向导提示词明确禁止询问上游 API 密钥 -- Setup wizard prompt forbids asking for upstream API keys",
+        "Fix / 修复: 版本字符串改为纯 ASCII -- Version string is now ASCII-only",
+        "Fix / 修复: SSE init 帧在设置响应头后立即发送 -- SSE init frame flushed immediately after headers",
+        "New / 新增: Base URL 卡片检测临时开发域名并显示提示 -- Base URL card detects temporary dev URLs",
+        "New / 新增: 安装向导新增跳过按钮及持久横幅 -- Setup wizard Skip button with persistent sticky banner"
+      ]
+    },
+    {
+      "version": "1.1.0",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "New / 新增: 舰队管理 HTML 面板，支持批量管理多个代理节点 -- Fleet Manager HTML panel for managing multiple proxy nodes",
+        "New / 新增: 启动时及每小时自动检测新版本 -- Hourly background version check on startup",
+        "New / 新增: 所有 /v1/* 响应头附带 X-Proxy-Version / X-Proxy-Update-Available / X-Proxy-Latest-Version"
+      ]
+    },
+    {
+      "version": "1.0.0",
+      "releaseDate": "2026-04-06",
+      "changelog": [
+        "Release / 发布: OpenAI 兼容代理，支持 Claude (Anthropic) 和 GPT/o 系列 (OpenAI) -- OpenAI-compatible proxy for Claude and GPT/o-series",
+        "Support / 支持: 工具调用、流式输出、图像识别、Claude 深度思考模式 -- Tool calling, streaming, image recognition, Claude thinking mode",
+        "Built-in / 内置: 安装向导、版本面板、Agent 提示词更新流程、源码分发 -- Setup wizard, version panel, Agent-prompt update flow, source distribution"
+      ]
+    }
+  ]
+}

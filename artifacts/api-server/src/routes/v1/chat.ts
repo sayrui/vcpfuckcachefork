@@ -1470,6 +1470,59 @@ async function handleOpenAINonStream(
 }
 
 // ----------------------------------------------------------------------
+// Dynamic Sinking Engine — Prompt Caching Optimisation
+// ----------------------------------------------------------------------
+const DYNAMIC_PATTERNS = [
+  /<!-- VCP_RAG_BLOCK_START[\s\S]*?VCP_RAG_BLOCK_END -->/g,
+  /————记忆区————[\s\S]*?————以上是过往记忆区————/g,
+  /今天是20\d{2}\/.*?(?=\n系统信息是|\n\n# |\n\n====)/g,
+  /# Current (Time|Cost)\n[\s\S]*?(?=\n# )/g
+];
+
+/**
+ * Extracts dynamic content from system text and appends it to the last user message.
+ * This stabilises the system prompt for better Anthropic prompt caching.
+ */
+function applyDynamicSinking(system: string, messages: OAIMessage[]): { system: string, messages: OAIMessage[], sunk: boolean } {
+  let currentSystem = system;
+  let sunkContent = "";
+  let found = false;
+
+  for (const pattern of DYNAMIC_PATTERNS) {
+    const matches = currentSystem.match(pattern);
+    if (matches) {
+      found = true;
+      sunkContent += "\n\n" + matches.join("\n\n");
+      currentSystem = currentSystem.replace(pattern, "").trim();
+    }
+  }
+
+  if (!found || !sunkContent.trim()) {
+    return { system, messages, sunk: false };
+  }
+
+  const newMsgs = [...messages];
+  let lastUserIdx = -1;
+  for (let i = newMsgs.length - 1; i >= 0; i--) {
+    if (newMsgs[i].role === "user") { lastUserIdx = i; break; }
+  }
+
+  if (lastUserIdx === -1) return { system, messages, sunk: false };
+
+  const lastMsg = { ...newMsgs[lastUserIdx] };
+  if (typeof lastMsg.content === "string") {
+    lastMsg.content = (lastMsg.content + sunkContent).trim();
+  } else if (Array.isArray(lastMsg.content)) {
+    lastMsg.content = [...lastMsg.content, { type: "text", text: sunkContent.trim() } as OAIContentPart];
+  } else {
+    return { system, messages, sunk: false };
+  }
+
+  newMsgs[lastUserIdx] = lastMsg;
+  return { system: currentSystem, messages: newMsgs, sunk: true };
+}
+
+// ----------------------------------------------------------------------
 // Prompt-based tool calling fallback
 // Triggered by `"x_use_prompt_tools": true` in the request body.
 // Works for any model/route. Injects a structured system prompt with the
@@ -1743,12 +1796,38 @@ router.post("/chat/completions", authMiddleware, async (req: Request, res: Respo
       return;
     }
 
+    // ── Dynamic Sinking ──────────────────────────────────────────────────────
+    // Move volatile VCP/RAG/timestamp blocks out of the Claude system prompt so
+    // Anthropic/OpenRouter prompt caching can match a stable prefix.
+    let finalMessages = messages;
+    let finalBody = body;
+
+    let sysMsgIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "system" && typeof messages[i].content === "string") {
+        sysMsgIdx = i;
+        break;
+      }
+    }
+
+    if (sysMsgIdx !== -1 && model.includes("claude")) {
+      const sysContent = messages[sysMsgIdx].content as string;
+      const sinkRes = applyDynamicSinking(sysContent, messages);
+      if (sinkRes.sunk) {
+        finalMessages = sinkRes.messages.map((m, i) =>
+          i === sysMsgIdx ? { ...m, content: sinkRes.system } : m
+        );
+        finalBody = { ...body, messages: finalMessages };
+        req.log.info({ model }, "Dynamic sinking applied to stabilize system prompt");
+      }
+    }
+
     // Prompt-based tool calling fallback — intercept before native routing.
     // Activated by `"x_use_prompt_tools": true` in the request body.
     // Strips `tools` from the upstream call and teaches the model via a
     // system-prompt injection instead, enabling tool calling on any model.
-    if (body.x_use_prompt_tools === true && body.tools?.length) {
-      await handlePromptTools(req, res, body);
+    if (finalBody.x_use_prompt_tools === true && finalBody.tools?.length) {
+      await handlePromptTools(req, res, finalBody);
       return;
     }
 
@@ -1782,13 +1861,13 @@ router.post("/chat/completions", authMiddleware, async (req: Request, res: Respo
       // Example: { model: "anthropic/claude-opus-4-5", messages } and
       //          { model: "...", messages, reasoning: { effort: "xhigh" }, verbosity: "high" }
       // both call OR with the same params and must share a cache entry.
-      let bodyForHash: Record<string, unknown> = body;
+      let bodyForHash: Record<string, unknown> = finalBody;
       if (isOpenRouter) {
-        const pt = sanitizeOpenRouterReasoning(body as Record<string, unknown>);
-        const rDef = getOpenRouterReasoningDefault(body.model, pt);
-        const vDef = getOpenRouterVerbosityDefault(body.model, pt);
+        const pt = sanitizeOpenRouterReasoning(finalBody as Record<string, unknown>);
+        const rDef = getOpenRouterReasoningDefault(finalBody.model, pt);
+        const vDef = getOpenRouterVerbosityDefault(finalBody.model, pt);
         if (Object.keys(rDef).length > 0 || Object.keys(vDef).length > 0) {
-          bodyForHash = { ...rDef, ...vDef, ...body };
+          bodyForHash = { ...rDef, ...vDef, ...finalBody };
         }
       }
       cacheKey = hashRequest(bodyForHash);
@@ -1829,27 +1908,27 @@ router.post("/chat/completions", authMiddleware, async (req: Request, res: Respo
     try {
       if (isClaude) {
         if (stream) {
-          await handleClaudeStream(req, res, body);
+          await handleClaudeStream(req, res, finalBody);
         } else {
-          await handleClaudeNonStream(req, res, body, cacheKey);
+          await handleClaudeNonStream(req, res, finalBody, cacheKey);
         }
       } else if (isGemini) {
         if (stream) {
-          await handleGeminiStream(req, res, body);
+          await handleGeminiStream(req, res, finalBody);
         } else {
-          await handleGeminiNonStream(req, res, body, cacheKey);
+          await handleGeminiNonStream(req, res, finalBody, cacheKey);
         }
       } else if (isOpenRouter) {
         if (stream) {
-          await handleOpenRouterStream(req, res, body);
+          await handleOpenRouterStream(req, res, finalBody);
         } else {
-          await handleOpenRouterNonStream(req, res, body, cacheKey);
+          await handleOpenRouterNonStream(req, res, finalBody, cacheKey);
         }
       } else {
         if (stream) {
-          await handleOpenAIStream(req, res, body);
+          await handleOpenAIStream(req, res, finalBody);
         } else {
-          await handleOpenAINonStream(req, res, body, cacheKey);
+          await handleOpenAINonStream(req, res, finalBody, cacheKey);
         }
       }
     } finally {

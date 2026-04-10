@@ -493,7 +493,7 @@ export function autoInjectPromptCaching(opts: {
   messages: Anthropic.MessageParam[];
   tools: Anthropic.Tool[] | undefined;
 } {
-  const cc = { type: "ephemeral" as const };
+  const cc = { type: "ephemeral" as const, ttl: "1h" };
 
   // Bail out if caller already set cache_control anywhere — respect manual control.
   const hasCC = (x: unknown): boolean =>
@@ -1747,35 +1747,239 @@ async function handleOpenAINonStream(
 }
 
 // ----------------------------------------------------------------------
-// Dynamic Sinking Engine — Prompt Caching Optimisation
+// Dynamic Sinking & LCP Engine — Prompt Caching Optimisation
 // ----------------------------------------------------------------------
-const DYNAMIC_PATTERNS = [
-  /<!-- VCP_RAG_BLOCK_START[\s\S]*?VCP_RAG_BLOCK_END -->/g,
-  /————记忆区————[\s\S]*?————以上是过往记忆区————/g,
-  /今天是20\d{2}\/.*?(?=\n系统信息是|\n\n# |\n\n====)/g,
-  /# Current (Time|Cost)\n[\s\S]*?(?=\n# )/g
+
+type SystemLayerTier = "stable" | "low" | "volatile";
+
+interface SystemLayerRule {
+  label: string;
+  tier: Exclude<SystemLayerTier, "stable">;
+  pattern: RegExp;
+}
+
+interface SystemLayerMatch {
+  start: number;
+  end: number;
+  text: string;
+  label: string;
+  tier: Exclude<SystemLayerTier, "stable">;
+}
+
+interface SystemLayerChunk {
+  tier: SystemLayerTier;
+  label: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface LayeredSystemAnalysis {
+  original: string;
+  comparableSystem: string;
+  systemWithoutVolatile: string;
+  stableText: string;
+  lowFrequencyText: string;
+  volatileText: string;
+  chunks: SystemLayerChunk[];
+  stableLength: number;
+  lowFrequencyLength: number;
+  volatileLength: number;
+  totalLength: number;
+  lowFrequencyLabels: string[];
+  volatileLabels: string[];
+}
+
+interface LCPSplitResult {
+  stable: string;
+  dynamic: string;
+  lcpLength: number;
+  divergeIndex: number;
+  divergenceSource: string;
+}
+
+interface LayeredSinkingResult {
+  system: string;
+  messages: OAIMessage[];
+  sunk: boolean;
+  analysis: LayeredSystemAnalysis;
+}
+
+const SYSTEM_LAYER_RULES: SystemLayerRule[] = [
+  {
+    label: "rag_block",
+    tier: "volatile",
+    pattern: /<!-- VCP_RAG_BLOCK_START[\s\S]*?VCP_RAG_BLOCK_END -->/g,
+  },
+  {
+    label: "memory_block",
+    tier: "volatile",
+    pattern: /(?:^|\n)————记忆区————\n[\s\S]*?\n————以上是过往记忆区————/g,
+  },
+  {
+    label: "date_weather_context",
+    tier: "volatile",
+    pattern: /(?:^|\n)今天是20\d{2}\/[^\n]*/g,
+  },
+  {
+    label: "weather_payload",
+    tier: "volatile",
+    pattern: /(?:^|\n)当前天气是\{\{[\s\S]*?\}\}[。.]?/g,
+  },
+  {
+    label: "system_info_line",
+    tier: "volatile",
+    pattern: /(?:^|\n)系统信息是[^\n]+/g,
+  },
+  {
+    label: "current_runtime_meta",
+    tier: "volatile",
+    pattern: /(?:^|\n)# Current (?:Time|Cost)\n(?:[^\n]*\n)*?(?=(?:# [^\n]+)|$)/g,
+  },
+  {
+    label: "expanded_time_runtime",
+    tier: "volatile",
+    pattern: /\{\{(?:Date|Time|Today|Festival)\}\}/g,
+  },
+  {
+    label: "async_result",
+    tier: "volatile",
+    pattern: /\{\{VCP_ASYNC_RESULT::[\s\S]*?\}\}/g,
+  },
+  {
+    label: "expanded_var_tar",
+    tier: "low",
+    pattern: /\{\{(?:Var|Tar)[^}\r\n]{20,}\}\}/g,
+  },
+  {
+    label: "meta_thinking_block",
+    tier: "low",
+    pattern: /(?:^|\n)————【VCP元思考】————\n[\s\S]*?\n————【VCP元思考】加载结束—————/g,
+  },
+  {
+    label: "timeline_block",
+    tier: "low",
+    pattern: /(?:^|\n)————日记时间线————\n[\s\S]*?(?=\n(?:————记忆区————|Nova的个人记忆二合一:))/g,
+  },
+  {
+    label: "toolbox_section",
+    tier: "low",
+    pattern: /(?:^|\n)# VCP [^\n]*工具箱能力收纳\n[\s\S]*?(?=\n(?:---\n\n)?# VCP [^\n]*工具箱能力收纳|\n—— 日记 \(DailyNote\) ——|\n额外指令:|\n————表情包系统————|\n====|$)/g,
+  },
+  {
+    label: "rendering_guide_block",
+    tier: "low",
+    pattern: /(?:^|\n)额外指令:当前Vchat客户端支持高级流式输出渲染器[\s\S]*?(?=\n(?:日记编辑工具：|————表情包系统————|====)|$)/g,
+  },
+  {
+    label: "dailynote_guide_block",
+    tier: "low",
+    pattern: /(?:^|\n)—— 日记 \(DailyNote\) ——\n[\s\S]*?(?=\n(?:额外指令:|————表情包系统————|====)|$)/g,
+  },
+  {
+    label: "emoji_catalog_block",
+    tier: "low",
+    pattern: /(?:^|\n)————表情包系统————\n[\s\S]*?(?=\n(?:可选音乐列表：|\(VCP Agent\)|====)|$)/g,
+  },
+  {
+    label: "toolbox_hint",
+    tier: "low",
+    pattern: /(?:^|\n)\*\(提示：当前上下文中还隐藏收纳了另外 \d+ 个工具模块分组，您可以通过明确提问或强调相关语境来获得展开。\)\*/g,
+  },
 ];
+
+function collectSystemLayerMatches(system: string): SystemLayerMatch[] {
+  const matches: SystemLayerMatch[] = [];
+  for (const rule of SYSTEM_LAYER_RULES) {
+    const regex = new RegExp(rule.pattern.source, rule.pattern.flags);
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(system)) !== null) {
+      const text = match[0] ?? "";
+      if (!text) {
+        if (regex.lastIndex === match.index) regex.lastIndex++;
+        continue;
+      }
+      matches.push({
+        start: match.index,
+        end: match.index + text.length,
+        text,
+        label: rule.label,
+        tier: rule.tier,
+      });
+      if (regex.lastIndex === match.index) regex.lastIndex++;
+    }
+  }
+  matches.sort((a, b) => a.start - b.start || b.end - a.end);
+  const accepted: SystemLayerMatch[] = [];
+  let cursor = -1;
+  for (const match of matches) {
+    if (match.start < cursor) continue;
+    accepted.push(match);
+    cursor = match.end;
+  }
+  return accepted;
+}
+
+function analyzeSystemLayers(system: string): LayeredSystemAnalysis {
+  const matches = collectSystemLayerMatches(system);
+  const chunks: SystemLayerChunk[] = [];
+  const stableParts: string[] = [];
+  const lowParts: string[] = [];
+  const volatileParts: string[] = [];
+  const keptSystemParts: string[] = [];
+  const lowFrequencyLabels: string[] = [];
+  const volatileLabels: string[] = [];
+
+  let cursor = 0;
+  for (const match of matches) {
+    if (match.start > cursor) {
+      const text = system.slice(cursor, match.start);
+      chunks.push({ tier: "stable", label: "stable_text", start: cursor, end: match.start, text });
+      stableParts.push(text);
+      keptSystemParts.push(text);
+    }
+    chunks.push({ tier: match.tier, label: match.label, start: match.start, end: match.end, text: match.text });
+    if (match.tier === "low") {
+      lowParts.push(match.text);
+      keptSystemParts.push(match.text);
+      if (!lowFrequencyLabels.includes(match.label)) lowFrequencyLabels.push(match.label);
+    } else {
+      volatileParts.push(match.text);
+      if (!volatileLabels.includes(match.label)) volatileLabels.push(match.label);
+    }
+    cursor = match.end;
+  }
+  if (cursor < system.length) {
+    const text = system.slice(cursor);
+    chunks.push({ tier: "stable", label: "stable_text", start: cursor, end: system.length, text });
+    stableParts.push(text);
+    keptSystemParts.push(text);
+  }
+
+  return {
+    original: system,
+    comparableSystem: keptSystemParts.join("").trim(),
+    systemWithoutVolatile: keptSystemParts.join("").trim(),
+    stableText: stableParts.join(""),
+    lowFrequencyText: lowParts.join(""),
+    volatileText: volatileParts.join(""),
+    chunks,
+    stableLength: stableParts.join("").length,
+    lowFrequencyLength: lowParts.join("").length,
+    volatileLength: volatileParts.join("").length,
+    totalLength: system.length,
+    lowFrequencyLabels,
+    volatileLabels,
+  };
+}
 
 /**
  * Extracts dynamic content from system text and appends it to the last user message.
- * This stabilises the system prompt for better Anthropic prompt caching.
  */
-function applyDynamicSinking(system: string, messages: OAIMessage[]): { system: string, messages: OAIMessage[], sunk: boolean } {
-  let currentSystem = system;
-  let sunkContent = "";
-  let found = false;
-
-  for (const pattern of DYNAMIC_PATTERNS) {
-    const matches = currentSystem.match(pattern);
-    if (matches) {
-      found = true;
-      sunkContent += "\n\n" + matches.join("\n\n");
-      currentSystem = currentSystem.replace(pattern, "").trim();
-    }
-  }
-
-  if (!found || !sunkContent.trim()) {
-    return { system, messages, sunk: false };
+function applyDynamicSinking(system: string, messages: OAIMessage[]): LayeredSinkingResult {
+  const analysis = analyzeSystemLayers(system);
+  if (!analysis.volatileText.trim()) {
+    return { system, messages, sunk: false, analysis };
   }
 
   const newMsgs = [...messages];
@@ -1784,19 +1988,132 @@ function applyDynamicSinking(system: string, messages: OAIMessage[]): { system: 
     if (newMsgs[i].role === "user") { lastUserIdx = i; break; }
   }
 
-  if (lastUserIdx === -1) return { system, messages, sunk: false };
+  if (lastUserIdx === -1) return { system, messages, sunk: false, analysis };
 
+  const sunkContent = analysis.volatileText.trim();
   const lastMsg = { ...newMsgs[lastUserIdx] };
   if (typeof lastMsg.content === "string") {
-    lastMsg.content = (lastMsg.content + sunkContent).trim();
+    lastMsg.content = (lastMsg.content + "\n\n" + sunkContent).trim();
   } else if (Array.isArray(lastMsg.content)) {
-    lastMsg.content = [...lastMsg.content, { type: "text", text: sunkContent.trim() } as OAIContentPart];
+    lastMsg.content = [...lastMsg.content, { type: "text", text: sunkContent } as OAIContentPart];
   } else {
-    return { system, messages, sunk: false };
+    return { system, messages, sunk: false, analysis };
   }
 
   newMsgs[lastUserIdx] = lastMsg;
-  return { system: currentSystem, messages: newMsgs, sunk: true };
+  return { system: analysis.systemWithoutVolatile, messages: newMsgs, sunk: true, analysis };
+}
+
+const _systemStabilityCache = new Map<string, string>();
+const _prevSystemTextCache = new Map<string, string>();
+
+function checkSystemStability(key: string, text: string): boolean {
+  const hash = String(text.length) + ":" + String(text.split("").reduce((acc, ch) => ((acc * 31) + ch.charCodeAt(0)) >>> 0, 0));
+  const prev = _systemStabilityCache.get(key);
+  _systemStabilityCache.set(key, hash);
+  return !!prev && prev === hash;
+}
+
+function computeLCPSplit(key: string, currentText: string): LCPSplitResult | null {
+  const prev = _prevSystemTextCache.get(key);
+  _prevSystemTextCache.set(key, currentText);
+  if (!prev || prev === currentText) return null;
+  const minLen = Math.min(prev.length, currentText.length);
+  let divergeIdx = 0;
+  while (divergeIdx < minLen && prev.charCodeAt(divergeIdx) === currentText.charCodeAt(divergeIdx)) divergeIdx++;
+  let boundary = currentText.lastIndexOf('\n', divergeIdx);
+  if (boundary <= 0) return null;
+  boundary += 1;
+  if (boundary < 4000) return null;
+  const stable = currentText.slice(0, boundary);
+  const dynamic = currentText.slice(boundary);
+  if (!dynamic.trim()) return null;
+  return { stable, dynamic, lcpLength: stable.length, divergeIndex: divergeIdx, divergenceSource: "system_text" };
+}
+
+interface HistoryCacheProbeResult {
+  mode: "string" | "array" | "none";
+  blockIndex: number;
+  cacheable: boolean;
+  alreadyCached: boolean;
+}
+
+function probeHistoryCacheAnchor(content: unknown): HistoryCacheProbeResult {
+  if (typeof content === "string") {
+    return { mode: "string", blockIndex: 0, cacheable: content.length > 0, alreadyCached: false };
+  }
+  if (!Array.isArray(content) || content.length === 0) {
+    return { mode: "none", blockIndex: -1, cacheable: false, alreadyCached: false };
+  }
+  for (let i = content.length - 1; i >= 0; i--) {
+    const block = content[i] as Record<string, unknown> | null | undefined;
+    if (!block || typeof block !== "object") continue;
+    const type = typeof block.type === "string" ? block.type : "";
+    const cacheable = type === "text" || type === "tool_result";
+    if (!cacheable) continue;
+    return { mode: "array", blockIndex: i, cacheable: true, alreadyCached: !!block.cache_control };
+  }
+  return { mode: "array", blockIndex: -1, cacheable: false, alreadyCached: false };
+}
+
+function injectHistoryBreakpoint(msgs: OAIMessage[]): { messages: OAIMessage[], applied: boolean } {
+  if (!msgs || msgs.length < 3) return { messages: msgs, applied: false };
+  let lastUserIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === "user") { lastUserIdx = i; break; }
+  }
+  if (lastUserIdx <= 0) return { messages: msgs, applied: false };
+
+  let anchorUserIdx = -1;
+  let anchorProbe: HistoryCacheProbeResult = { mode: "none", blockIndex: -1, cacheable: false, alreadyCached: false };
+
+  for (let i = lastUserIdx - 1; i >= 0; i--) {
+    if (msgs[i].role !== "user") continue;
+    const probe = probeHistoryCacheAnchor(msgs[i].content);
+    if (!probe.cacheable && !probe.alreadyCached) continue;
+    anchorUserIdx = i;
+    anchorProbe = probe;
+    break;
+  }
+
+  if (anchorUserIdx < 0 || anchorProbe.alreadyCached) return { messages: msgs, applied: anchorProbe.alreadyCached };
+
+  const msg = msgs[anchorUserIdx];
+  const newMsgs = [...msgs];
+  const cc = { type: "ephemeral" as const };
+
+  if (anchorProbe.mode === "string" && typeof msg.content === "string") {
+    newMsgs[anchorUserIdx] = { ...msg, content: [{ type: "text", text: msg.content, cache_control: cc } as OAIContentPart] };
+    return { messages: newMsgs, applied: true };
+  }
+  if (anchorProbe.mode === "array" && Array.isArray(msg.content)) {
+    const content = [...msg.content];
+    content[anchorProbe.blockIndex] = { ...content[anchorProbe.blockIndex], cache_control: cc };
+    newMsgs[anchorUserIdx] = { ...msg, content };
+    return { messages: newMsgs, applied: true };
+  }
+  return { messages: msgs, applied: false };
+}
+
+// ----------------------------------------------------------------------
+// Layered cache helpers for OpenAI-compatible routes
+// ----------------------------------------------------------------------
+
+function flattenSystemTextContent(content: string | OAIContentPart[] | null | undefined): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => (part as { type?: string }).type === "text")
+    .map((part) => ((part as { text?: string }).text ?? ""))
+    .join("");
+}
+
+function hasAnyOpenAIBlockCacheControl(messages: OAIMessage[]): boolean {
+  return messages.some((message) =>
+    Array.isArray(message.content) &&
+    message.content.some((part) => !!(part as Record<string, unknown>)?.cache_control)
+  );
 }
 
 // ----------------------------------------------------------------------
@@ -2077,26 +2394,74 @@ router.post("/chat/completions", authMiddleware, async (req: Request, res: Respo
     const isGemini = model.startsWith("gemini-");
     const isOpenRouter = !isClaude && !isGemini && model.includes("/");
 
-    // ── Dynamic Sinking ──────────────────────────────────────────────────────
-    // Pre-process messages to move dynamic system content (RAG, timestamps) to
-    // the end of the conversation. This ensures the base system prompt stays
-    // byte-identical, allowing prompt caching to work even when VCP context
-    // changes every turn.
+    // ── Layered Claude cache plan ────────────────────────────────────────────
+    // Tier 1: stable system → top-level cache_control
+    // Tier 2: unstable but long common prefix → explicit system breakpoint
+    // P2: conversation history breakpoint
+    // If nothing is cacheable, still sink volatile layers out of system.
     let finalMessages = messages;
     let finalBody = body;
 
-    const sysMsg = messages.find(m => m.role === "system");
+    const sysMsgIndex = messages.findIndex((m) => m.role === "system");
+    const sysMsg = sysMsgIndex >= 0 ? messages[sysMsgIndex] : undefined;
+    const isClaudeFamily = model.includes("claude") || isOpenRouterAnthropicModel(model);
     const skipDynamicSinkingForStickyRouting = shouldSkipDynamicSinkingForStickyRouting(model, messages);
+
     if (skipDynamicSinkingForStickyRouting) {
       req.log.info({ model }, "dynamic sinking skipped for sticky routing");
-    } else if (sysMsg && typeof sysMsg.content === "string" && model.includes("claude")) {
-      const sinkRes = applyDynamicSinking(sysMsg.content, messages);
-      if (sinkRes.sunk) {
+    } else if (
+      isClaudeFamily &&
+      sysMsg &&
+      !hasAnyOpenAIBlockCacheControl(messages)
+    ) {
+      const systemText = flattenSystemTextContent(sysMsg.content);
+      if (systemText) {
+        const stableKey = `chat|${model}|${systemText.slice(0, 256)}`;
+        const sinkRes = applyDynamicSinking(systemText, messages);
         finalMessages = sinkRes.messages;
-        const newSysMsg = { ...sysMsg, content: sinkRes.system };
-        finalMessages = finalMessages.map(m => m.role === "system" ? newSysMsg : m);
-        finalBody = { ...body, messages: finalMessages };
-        req.log.info({ model }, "Dynamic sinking applied to stabilize system prompt");
+
+        const comparableSystem = sinkRes.analysis.comparableSystem;
+        const stable = comparableSystem.length > 0 ? checkSystemStability(stableKey, comparableSystem) : false;
+        const lcpResult = comparableSystem.length > 0 ? computeLCPSplit(stableKey, comparableSystem) : null;
+
+        let rewrittenSystemContent: string | OAIContentPart[] = sinkRes.system;
+        let cachePlan = "none";
+
+        if (stable) {
+          finalBody = { ...body, cache_control: body.cache_control ?? { type: "ephemeral", ttl: "1h" } };
+          rewrittenSystemContent = sinkRes.system;
+          cachePlan = "T1";
+        } else if (lcpResult) {
+          rewrittenSystemContent = [
+            { type: "text", text: lcpResult.stable, cache_control: { type: "ephemeral", ttl: "1h" } } as OAIContentPart,
+            { type: "text", text: lcpResult.dynamic } as OAIContentPart,
+          ];
+          cachePlan = "T2";
+        }
+
+        finalMessages = finalMessages.map((m, idx) =>
+          idx === sysMsgIndex ? { ...m, content: rewrittenSystemContent } : m
+        );
+
+        const historyResult = injectHistoryBreakpoint(finalMessages);
+        finalMessages = historyResult.messages;
+        if (historyResult.applied) {
+          cachePlan = cachePlan === "none" ? "P2" : `${cachePlan}+P2`;
+        }
+
+        finalBody = { ...finalBody, messages: finalMessages };
+
+        req.log.info({
+          model,
+          cachePlan,
+          stableLayerLength: sinkRes.analysis.stableLength,
+          lowFrequencyLayerLength: sinkRes.analysis.lowFrequencyLength,
+          volatileLayerLength: sinkRes.analysis.volatileLength,
+          comparableSystemLength: sinkRes.analysis.comparableSystem.length,
+          lcpLength: lcpResult?.lcpLength ?? 0,
+          sunk: sinkRes.sunk,
+          historyApplied: historyResult.applied,
+        }, "layered claude cache plan applied");
       }
     }
 
